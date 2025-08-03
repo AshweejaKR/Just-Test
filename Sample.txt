@@ -1,1 +1,547 @@
-Hi Hello
+
+import requests
+from datetime import datetime, timedelta
+import os
+import pandas as pd
+import numpy as np
+
+def get_nifty200_stocks():
+    """
+    Reads the ind_nifty200list.csv file and returns a set of symbols.
+    Returns an empty set if the file doesn't exist.
+    """
+    nifty200_file = "ind_nifty200list.csv"
+    if not os.path.exists(nifty200_file):
+        print(f"Warning: {nifty200_file} not found. Returning empty set.")
+        return set()
+    
+    try:
+        # Read the CSV file containing Nifty 200 stocks
+        df = pd.read_csv(nifty200_file)
+        
+        print(f"Columns in {nifty200_file}: {df.columns.tolist()}")
+        
+        # Use the Symbol column which is in 3rd position (index 2) based on our check
+        if 'Symbol' in df.columns:
+            symbols = set(df['Symbol'].tolist())
+        else:
+            # Fallback to the third column if column name is different
+            symbols = set(df.iloc[:, 2].tolist())
+            
+        print(f"Loaded {len(symbols)} stocks from Nifty 200 list")
+        # Print a few symbols as sanity check
+        print(f"Sample symbols: {list(symbols)[:5]}")
+        return symbols
+    except Exception as e:
+        print(f"Error reading {nifty200_file}: {e}")
+        return set()
+
+def download_bhavcopy(date_str):
+    """
+    Downloads the sec_bhavdata_full_{date}.csv file from NSE for the given date.
+    date_str: date in 'ddmmYYYY' format (e.g., '30072025' for 30-Jul-2025)
+    """
+    url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
+    filename = f"sec_bhavdata_full_{date_str}.csv"
+    
+    # Check if file already exists
+    if os.path.exists(filename):
+        print(f"File {filename} already exists, skipping download.")
+        return True
+    
+    print(f"Downloading: {url}")
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        print(f"Downloaded and saved as {filename}")
+        return True
+    else:
+        print(f"Failed to download file. Status code: {response.status_code}")
+        return False
+
+def download_last_n_days(n=22):
+    """
+    Downloads bhav copy files for the last n days, skipping weekends and existing files.
+    """
+    today = datetime.now()
+    success_count = 0
+    attempt_count = 0
+    dates = []
+    
+    # We'll try more days than requested to account for weekends and holidays
+    # when the market might be closed
+    max_attempts = n * 2
+    
+    for i in range(max_attempts):
+        if success_count >= n:
+            break
+            
+        date = today - timedelta(days=i)
+        # Skip weekends (5 = Saturday, 6 = Sunday)
+        if date.weekday() >= 5:
+            print(f"Skipping weekend: {date.strftime('%d-%m-%Y')}")
+            continue
+        
+        attempt_count += 1
+        date_str = date.strftime("%d%m%Y")  # Format for the URL: ddmmYYYY
+        if download_bhavcopy(date_str):
+            success_count += 1
+            dates.append(date_str)
+        
+    print(f"Downloaded {success_count} files out of {attempt_count} attempts.")
+    return dates
+
+def get_data_from_file(date_str):
+    """
+    Reads the CSV file for the given date and returns a DataFrame.
+    """
+    filename = f"sec_bhavdata_full_{date_str}.csv"
+    if not os.path.exists(filename):
+        print(f"File {filename} does not exist.")
+        return None
+    
+    try:
+        # Read the CSV file
+        df = pd.read_csv(filename)
+        # print(f"Read {len(df)} rows from {filename}")
+        # print(f"Columns: {df.columns.tolist()}")
+        # print(f"Data: {df}")
+        # We'll keep original column names for consistency
+        return df
+    except Exception as e:
+        print(f"Error reading file {filename}: {e}")
+        return None
+
+def higher_delivery_percentage(threshold=75):
+    """
+    Return the list of stocks which having the delivery percentage more than 75%
+    Filter: SERIES must be 'EQ' and  TTL_TRD_QNTY must be > 10000
+    """
+    today = datetime.now()
+    date_str = today.strftime("%d%m%Y")
+    
+    df = get_data_from_file(date_str)
+    if df is None:
+        return []
+    
+    # Apply basic filters
+    if ' SERIES' in df.columns and ' TTL_TRD_QNTY' in df.columns:
+        print(f"df before filtering - shape: {df.shape}")
+        # Check what values are actually in the SERIES column
+        print(f"Unique SERIES values: {df[' SERIES'].unique()}")
+        # Print some sample TTL_TRD_QNTY values
+        print(f"TTL_TRD_QNTY sample: {df[' TTL_TRD_QNTY'].head()}")
+        
+        # Try to use a more lenient filter or skip filtering if it would make df empty
+        series_filter = df[' SERIES'] == 'EQ'
+        quantity_filter = df[' TTL_TRD_QNTY'] > 10000
+        
+        if series_filter.any() and quantity_filter.any():
+            # Apply both filters only if they wouldn't make df empty
+            df = df[series_filter & quantity_filter]
+        elif series_filter.any():
+            # Apply only series filter if it wouldn't make df empty
+            df = df[series_filter]
+            print("Applied only SERIES filter, TTL_TRD_QNTY filter would make df empty")
+        else:
+            # Skip filtering to prevent empty df
+            print("Skipped filtering to prevent empty dataframe")
+        
+        print(f"df after filtering - shape: {df.shape}")
+    else:
+        print("SERIES or  TTL_TRD_QNTY columns not found in the data")
+        return []
+    
+    # Filter stocks with delivery percentage > threshold
+    if ' DELIV_PER' in df.columns:
+        print(f"DELIV_PER column found, checking values...")
+        print(f"DELIV_PER dtype: {df[' DELIV_PER'].dtype}")
+        print(f"Sample values: {df[' DELIV_PER'].head()}")
+        
+        # Handle potential conversion issues by explicitly converting to numeric
+        # Use pd.to_numeric with errors='coerce' to convert invalid values to NaN
+        try:
+            # Convert to numeric, handling non-numeric values
+            df[' DELIV_PER_NUM'] = pd.to_numeric(df[' DELIV_PER'], errors='coerce')
+            
+            # Filter using the converted numeric column
+            high_delivery_stocks = df[df[' DELIV_PER_NUM'] > threshold].dropna(subset=[' DELIV_PER_NUM'])
+            print(f"Found {len(high_delivery_stocks)} stocks after numeric filtering")
+            
+            # Use a more explicit approach if needed
+            result = []
+            for idx, row in df.iterrows():
+                try:
+                    deliv_per = float(row[' DELIV_PER'])
+                    if deliv_per > threshold:
+                        result.append(row['SYMBOL'])
+                except (ValueError, TypeError):
+                    # Skip any values that can't be converted to float
+                    pass
+            
+            # Filter results to only include stocks from Nifty 200 list
+            nifty200_stocks = get_nifty200_stocks()
+            filtered_result = [symbol for symbol in result if symbol in nifty200_stocks]
+            
+            # Print the list of stocks
+            print(f"\nStocks with high delivery percentage > {threshold}% (in Nifty 200):")
+            for symbol in filtered_result:
+                print(f"- {symbol}")
+            
+            print(f"Found {len(filtered_result)} stocks from Nifty 200 out of {len(result)} total matches")
+            
+            return filtered_result
+        except Exception as e:
+            print(f"Error during DELIV_PER filtering: {e}")
+            return []
+    else:
+        print("DELIV_PER column not found in the data")
+        return []
+
+def get_average_for_last_days(column_name, days=5):
+    """
+    Calculate the average of the given column for the last n days for each stock.
+    Returns a dictionary with symbol as key and average as value.
+    Filter: SERIES must be 'EQ' and  TTL_TRD_QNTY must be > 10000
+    """
+    today = datetime.now()
+    averages = {}
+    stock_data = {}
+    
+    # Collect data for the last 'days' days
+    for i in range(1, days + 1):
+        date = today - timedelta(days=i)
+        if date.weekday() >= 5:  # Skip weekends
+            continue
+        
+        date_str = date.strftime("%d%m%Y")
+        df = get_data_from_file(date_str)
+        
+        if df is None:
+            continue
+        
+        if column_name not in df.columns:
+            continue
+        
+        # Apply the same filters to historical data
+        if ' SERIES' in df.columns and ' TTL_TRD_QNTY' in df.columns:
+            # Try to use a more lenient filter or skip filtering if it would make df empty
+            series_filter = df[' SERIES'] == 'EQ'
+            quantity_filter = df[' TTL_TRD_QNTY'] > 10000
+            
+            if series_filter.any() and quantity_filter.any():
+                df = df[series_filter & quantity_filter]
+            elif series_filter.any():
+                df = df[series_filter]
+            # If both filters would make df empty, keep df as is
+        
+        for idx, row in df.iterrows():
+            try:
+                symbol = row['SYMBOL']
+                # Try to safely convert the value to a numeric type
+                try:
+                    value = float(row[column_name])
+                    
+                    if symbol not in stock_data:
+                        stock_data[symbol] = []
+                        
+                    stock_data[symbol].append(value)
+                except (ValueError, TypeError):
+                    # Skip this value if it can't be converted to float
+                    continue
+            except Exception as e:
+                print(f"Error processing historical row {idx}: {e}")
+                continue
+    
+    # Calculate averages
+    for symbol, values in stock_data.items():
+        if len(values) > 0:
+            averages[symbol] = sum(values) / len(values)
+    
+    return averages
+
+def higher_delivery_quantity(threshold=1.5):
+    """
+    Return the list of stocks which having the delivery quantity more than 1.5 times of last 5 days.
+    Filter: SERIES must be 'EQ' and  TTL_TRD_QNTY must be > 10000
+    """
+    today = datetime.now()
+    date_str = today.strftime("%d%m%Y")
+    
+    df = get_data_from_file(date_str)
+    if df is None:
+        return []
+    
+    # Apply basic filters
+    if ' SERIES' in df.columns and ' TTL_TRD_QNTY' in df.columns:
+        # Try to use a more lenient filter or skip filtering if it would make df empty
+        series_filter = df[' SERIES'] == 'EQ'
+        quantity_filter = df[' TTL_TRD_QNTY'] > 10000
+        
+        if series_filter.any() and quantity_filter.any():
+            df = df[series_filter & quantity_filter]
+        elif series_filter.any():
+            df = df[series_filter]
+            print("Applied only SERIES filter, TTL_TRD_QNTY filter would make df empty")
+        else:
+            print("Skipped filtering to prevent empty dataframe")
+    else:
+        print("SERIES or  TTL_TRD_QNTY columns not found in the data")
+        return []
+    
+    # Get average delivery quantity for last 5 days
+    avg_delivery_qty = get_average_for_last_days(' DELIV_QTY', 5)
+    
+    result = []
+    for idx, row in df.iterrows():
+        try:
+            symbol = row['SYMBOL']
+            if symbol in avg_delivery_qty:
+                # Safely convert to numeric value
+                try:
+                    today_qty = float(row[' DELIV_QTY'])
+                    avg_qty = avg_delivery_qty[symbol]
+                    
+                    if today_qty > threshold * avg_qty:
+                        result.append(symbol)
+                except (ValueError, TypeError):
+                    # Skip if conversion fails
+                    continue
+        except Exception as e:
+            print(f"Error processing row {idx}: {e}")
+            continue
+    
+    # Filter results to only include stocks from Nifty 200 list
+    nifty200_stocks = get_nifty200_stocks()
+    filtered_result = [symbol for symbol in result if symbol in nifty200_stocks]
+    
+    # Print the list of stocks
+    print(f"\nStocks with delivery quantity > {threshold}x 5-day average (in Nifty 200):")
+    for symbol in filtered_result:
+        print(f"- {symbol}")
+    
+    print(f"Found {len(filtered_result)} stocks from Nifty 200 out of {len(result)} total matches")
+    
+    return filtered_result
+
+def higher_delivery_quantity_and_percentage(delivery_pct_threshold=75, delivery_qty_threshold=1.5):
+    """
+    Return the list of stocks which having the delivery percentage more than 75% 
+    and the delivery quantity more than 1.5 times of last 5 days.
+    """
+    high_pct_stocks = set(higher_delivery_percentage(delivery_pct_threshold))
+    high_qty_stocks = set(higher_delivery_quantity(delivery_qty_threshold))
+    
+    # Find intersection of both sets
+    result = list(high_pct_stocks.intersection(high_qty_stocks))
+    
+    # Filter results to only include stocks from Nifty 200 list
+    nifty200_stocks = get_nifty200_stocks()
+    filtered_result = [symbol for symbol in result if symbol in nifty200_stocks]
+    
+    # Print the list of stocks
+    print(f"\nStocks with both high delivery percentage > {delivery_pct_threshold}% and quantity > {delivery_qty_threshold}x (in Nifty 200):")
+    for symbol in filtered_result:
+        print(f"- {symbol}")
+    
+    print(f"Found {len(filtered_result)} stocks from Nifty 200 out of {len(result)} total matches")
+    
+    return filtered_result
+
+def higher_trade_quantity(threshold=1.5):
+    """
+    Return the list of stocks which having the trade quantity more than 1.5 times of last 5 days.
+    Filter: SERIES must be 'EQ' and  TTL_TRD_QNTY must be > 10000
+    """
+    today = datetime.now()
+    date_str = today.strftime("%d%m%Y")
+    
+    df = get_data_from_file(date_str)
+    if df is None:
+        return []
+    
+    # Apply basic filters
+    if ' SERIES' in df.columns and ' TTL_TRD_QNTY' in df.columns:
+        # Try to use a more lenient filter or skip filtering if it would make df empty
+        series_filter = df[' SERIES'] == 'EQ'
+        quantity_filter = df[' TTL_TRD_QNTY'] > 10000
+        
+        if series_filter.any() and quantity_filter.any():
+            df = df[series_filter & quantity_filter]
+        elif series_filter.any():
+            df = df[series_filter]
+            print("Applied only SERIES filter, TTL_TRD_QNTY filter would make df empty")
+        else:
+            print("Skipped filtering to prevent empty dataframe")
+    else:
+        print("SERIES or  TTL_TRD_QNTY columns not found in the data")
+        return []
+    
+    # Get average trade quantity for last 5 days
+    avg_trade_qty = get_average_for_last_days(' TTL_TRD_QNTY', 5)
+    
+    result = []
+    for idx, row in df.iterrows():
+        try:
+            symbol = row['SYMBOL']
+            if symbol in avg_trade_qty:
+                # Safely convert to numeric value
+                try:
+                    today_qty = float(row[' TTL_TRD_QNTY'])
+                    avg_qty = avg_trade_qty[symbol]
+                    
+                    if today_qty > threshold * avg_qty:
+                        result.append(symbol)
+                except (ValueError, TypeError):
+                    # Skip if conversion fails
+                    continue
+        except Exception as e:
+            print(f"Error processing row {idx}: {e}")
+            continue
+    
+    # Filter results to only include stocks from Nifty 200 list
+    nifty200_stocks = get_nifty200_stocks()
+    filtered_result = [symbol for symbol in result if symbol in nifty200_stocks]
+    
+    # Print the list of stocks
+    print(f"\nStocks with trade quantity > {threshold}x 5-day average (in Nifty 200):")
+    for symbol in filtered_result:
+        print(f"- {symbol}")
+    
+    print(f"Found {len(filtered_result)} stocks from Nifty 200 out of {len(result)} total matches")
+    
+    return filtered_result
+
+def higher_trade_quantity_and_delivery_quantity(threshold=1.5):
+    """
+    Return the list of stocks which having the both trade quantity and 
+    delivery quantity more than 1.5 times of last 5 days.
+    """
+    high_trade_qty_stocks = set(higher_trade_quantity(threshold))
+    high_delivery_qty_stocks = set(higher_delivery_quantity(threshold))
+    
+    # Find intersection of both sets
+    result = list(high_trade_qty_stocks.intersection(high_delivery_qty_stocks))
+    
+    # Filter results to only include stocks from Nifty 200 list
+    nifty200_stocks = get_nifty200_stocks()
+    filtered_result = [symbol for symbol in result if symbol in nifty200_stocks]
+    
+    # Print the list of stocks
+    print(f"\nStocks with both trade and delivery quantity > {threshold}x 5-day average (in Nifty 200):")
+    for symbol in filtered_result:
+        print(f"- {symbol}")
+    
+    print(f"Found {len(filtered_result)} stocks from Nifty 200 out of {len(result)} total matches")
+    
+    return filtered_result
+
+def stocks_to_be_traded():
+    """
+    Calls all 5 APIs and identifies stocks present in at least 2 lists.
+    Saves the results in a CSV file with marks indicating which list each stock appears in.
+    Only considers stocks that are part of the Nifty 200 list.
+    
+    Returns:
+        List of stocks that appear in at least 2 of the 5 lists
+    """
+    print("Analyzing stocks for trading opportunities (filtered to Nifty 200 only)...")
+    
+    # First verify that we have access to the Nifty 200 list
+    nifty200_stocks = get_nifty200_stocks()
+    if not nifty200_stocks:
+        print("Warning: No stocks found in Nifty 200 list. Results may be empty.")
+    
+    # Call all 5 APIs - each already filters to only include Nifty 200 stocks
+    list1 = set(higher_delivery_percentage())  # > 70% delivery percentage
+    list2 = set(higher_delivery_quantity())    # > 1.5x delivery quantity
+    list3 = set(higher_delivery_quantity_and_percentage())  # Both conditions
+    list4 = set(higher_trade_quantity())       # > 1.5x trade quantity
+    list5 = set(higher_trade_quantity_and_delivery_quantity())  # Both quantities
+    
+    # Get all unique stocks from all lists
+    all_stocks = list1.union(list2).union(list3).union(list4).union(list5)
+    
+    # Dictionary to track which lists each stock appears in
+    stock_appearances = {}
+    for stock in all_stocks:
+        appearances = []
+        if stock in list1:
+            appearances.append(1)
+        if stock in list2:
+            appearances.append(2)
+        if stock in list3:
+            appearances.append(3)
+        if stock in list4:
+            appearances.append(4)
+        if stock in list5:
+            appearances.append(5)
+        
+        stock_appearances[stock] = appearances
+    
+    # Filter stocks that appear in at least 2 lists
+    trading_stocks = []
+    for stock, appearances in stock_appearances.items():
+        if len(appearances) >= 2:
+            trading_stocks.append(stock)
+    
+    # Sort the final list alphabetically
+    trading_stocks.sort()
+    
+    # Create CSV file
+    today = datetime.now()
+    date_str = today.strftime("%d%m%Y")
+    csv_filename = f"trading_stocks_{date_str}.csv"
+    
+    with open(csv_filename, 'w') as f:
+        # Write header
+        f.write("Symbol,High_Deliv_Per,High_Deliv_Qty,High_Both_Delivery,High_Trade_Quantity,High_Both_Quantities,Total_Lists\n")
+        
+        # Write data for stocks in at least 2 lists
+        for stock in trading_stocks:
+            appearances = stock_appearances[stock]
+            row = [
+                stock,
+                "Yes" if 1 in appearances else "No",
+                "Yes" if 2 in appearances else "No",
+                "Yes" if 3 in appearances else "No",
+                "Yes" if 4 in appearances else "No",
+                "Yes" if 5 in appearances else "No",
+                len(appearances)
+            ]
+            f.write(",".join(map(str, row)) + "\n")
+    
+    print(f"Analysis complete. Found {len(trading_stocks)} stocks appearing in at least 2 lists.")
+    print(f"Results saved to {csv_filename}")
+    
+    return trading_stocks
+
+if __name__ == "__main__":
+    # Download data for the last 22 days if not already downloaded
+    print("Downloading NSE Bhavcopy data for the last 22 trading days...")
+    # download_last_n_days(22)
+    
+    # Example usage of the analysis functions
+    print("\nAnalyzing today's data...")
+    
+    # Call all 5 APIs - each will print its own list of stocks
+    high_delivery_pct = higher_delivery_percentage()
+    print(f"high_delivery_pct: {high_delivery_pct}, length: {len(high_delivery_pct)}")
+    high_delivery_qty = higher_delivery_quantity()
+    print(f"high_delivery_qty: {high_delivery_qty}, length: {len(high_delivery_qty)}")
+    high_both = higher_delivery_quantity_and_percentage()
+    print(f"high_both: {high_both}, length: {len(high_both)}")
+    high_trade_qty = higher_trade_quantity()
+    print(f"high_trade_qty: {high_trade_qty}, length: {len(high_trade_qty)}")
+    high_trade_and_delivery = higher_trade_quantity_and_delivery_quantity()
+    print(f"high_trade_and_delivery: {high_trade_and_delivery}, length: {len(high_trade_and_delivery)}")
+
+    print("\n" + "="*50)
+    print("Generating stocks to trade (in at least 2 lists)...")
+    stocks_to_trade = stocks_to_be_traded()
+    print("\nRecommended stocks for trading:")
+    for symbol in stocks_to_trade[:20]:  # Print first 20 results
+        print(f"- {symbol}")
+    if len(stocks_to_trade) > 20:
+        print(f"... and {len(stocks_to_trade) - 20} more. See CSV file for complete list.")
